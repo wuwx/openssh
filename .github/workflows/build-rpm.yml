@@ -1,4 +1,4 @@
-name: Build RPM (Rocky Linux 8)
+name: Build RPM (Rocky Linux 8 / 9)
 
 on:
   push:
@@ -24,29 +24,49 @@ env:
 
 jobs:
   build:
-    name: Build RPM on Rocky Linux 8
+    name: Build RPM on Rocky Linux (${{ matrix.os }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: el8
+            image: rockylinux:8
+            crb: powertools
+            # imake(xmkmf) 由 el8 的 CRB 仓库提供
+            epel: false
+          - os: el9
+            image: rockylinux:9
+            crb: crb
+            # RHEL9 移除了 imake，改从 EPEL 获取（imake-1.0.8-6.el9）
+            epel: true
     container:
-      image: rockylinux:8 # 等价镜像：quay.io/rockylinux/rockylinux:8
+      image: ${{ matrix.image }}
       options: --user root
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Enable CRB repo and install build dependencies
+      - name: Enable CRB/EPEL repos and install build dependencies
         run: |
           set -eux
           dnf -y install dnf-plugins-core
-          # -devel 类包位于 CRB 仓库（Rocky Linux 8 中名为 powertools）
-          dnf config-manager --set-enabled powertools || dnf config-manager --set-enabled crb
-          # 说明：spec 的 BuildRequires 写了 /bin/login，而 Rocky 8 的 rpmdb 只提供
+          # -devel 类包位于 CRB 仓库（el8 中名为 powertools，el9 中名为 crb）
+          dnf config-manager --set-enabled ${{ matrix.crb }} || dnf config-manager --set-enabled crb
+          if [ "${{ matrix.epel }}" = "true" ]; then
+            dnf -y install epel-release
+          fi
+          # 说明：spec 的 BuildRequires 写了 /bin/login，而 Rocky 的 rpmdb 只提供
           # /usr/bin/login，`dnf builddep` 会因该依赖无法解析而整体失败，
           # 因此这里按 spec 逐项安装等价依赖（rpmbuild 自身的依赖检查可通过）。
           dnf -y install \
             rpm-build make gcc \
             perl openssl-devel krb5-devel pam-devel \
-            glibc-devel libXt-devel gtk2-devel imake pkgconf-pkg-config \
-            util-linux curl tar gzip
+            glibc-devel libXt-devel gtk2-devel pkgconf-pkg-config \
+            util-linux tar gzip
+          # x11-ssh-askpass 用 xmkmf(imake) 构建：el8 来自 CRB，el9 来自 EPEL
+          # 基础镜像自带 curl（el9 为 curl-minimal），不能再装 curl 以免依赖冲突
+          dnf -y install imake
 
       - name: Fetch sources
         id: source
@@ -82,7 +102,7 @@ jobs:
       - name: Upload RPMs
         uses: actions/upload-artifact@v4
         with:
-          name: openssh-${{ steps.source.outputs.version }}-el8.x86_64
+          name: openssh-${{ steps.source.outputs.version }}-${{ matrix.os }}.x86_64
           path: |
             rpmbuild/RPMS/*/*.rpm
             rpmbuild/SRPMS/*.rpm
