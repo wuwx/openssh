@@ -40,7 +40,7 @@ jobs:
             # RHEL9 移除了 imake，改从 EPEL 获取（imake-1.0.8-6.el9）
             epel: true
           - os: el10
-            image: rockylinux:10
+            image: rockylinux/rockylinux:10
             crb: crb
             # RHEL10 把 imake 和 gtk2-devel 都移除了，两者均由 EPEL 10 提供
             # （imake-1.0.10、gtk2-devel-2.24.33）
