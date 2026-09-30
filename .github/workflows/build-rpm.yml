@@ -1,0 +1,90 @@
+name: Build RPM (Rocky Linux 8)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # RPM 构建树根目录（%_topdir），放在 workspace 内便于收集产物
+  TOPDIR: ${{ github.workspace }}/rpmbuild
+  # Source1 的上游地址 www.jmknoble.net 现已位于 Cloudflare 挑战页之后，CI 无法下载。
+  # 改用 Fedora 归档中同一份 x11-ssh-askpass tarball，并用 md5 校验完整性。
+  ASKPASS_TARBALL: x11-ssh-askpass-1.2.4.1.tar.gz
+  ASKPASS_MD5: 8f2e41f3f7eaa8543a2440454637f3c3
+
+jobs:
+  build:
+    name: Build RPM on Rocky Linux 8
+    runs-on: ubuntu-24.04
+    container:
+      image: rockylinux:8 # 等价镜像：quay.io/rockylinux/rockylinux:8
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable CRB repo and install build dependencies
+        run: |
+          set -eux
+          dnf -y install dnf-plugins-core
+          # -devel 类包位于 CRB 仓库（Rocky Linux 8 中名为 powertools）
+          dnf config-manager --set-enabled powertools || dnf config-manager --set-enabled crb
+          # 说明：spec 的 BuildRequires 写了 /bin/login，而 Rocky 8 的 rpmdb 只提供
+          # /usr/bin/login，`dnf builddep` 会因该依赖无法解析而整体失败，
+          # 因此这里按 spec 逐项安装等价依赖（rpmbuild 自身的依赖检查可通过）。
+          dnf -y install \
+            rpm-build make gcc \
+            perl openssl-devel krb5-devel pam-devel \
+            glibc-devel libXt-devel gtk2-devel imake pkgconf-pkg-config \
+            util-linux curl tar gzip
+
+      - name: Fetch sources
+        id: source
+        run: |
+          set -eux
+          VERSION="$(rpmspec -q --qf '%{version}\n' openssh.spec | head -n1)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          mkdir -p "$TOPDIR"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          cp openssh.spec "$TOPDIR/SPECS/"
+
+          # Source0: openssh-<version>.tar.gz
+          curl -fSL --retry 3 --retry-delay 2 \
+            -o "$TOPDIR/SOURCES/openssh-$VERSION.tar.gz" \
+            "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-$VERSION.tar.gz"
+
+          # Source1: x11-ssh-askpass（Fedora lookaside 归档）
+          curl -fSL --retry 3 --retry-delay 2 \
+            -o "$TOPDIR/SOURCES/$ASKPASS_TARBALL" \
+            "https://src.fedoraproject.org/lookaside/pkgs/openssh/$ASKPASS_TARBALL/$ASKPASS_MD5/$ASKPASS_TARBALL"
+          echo "$ASKPASS_MD5  $TOPDIR/SOURCES/$ASKPASS_TARBALL" | md5sum -c -
+
+      - name: Build RPM
+        run: |
+          set -o pipefail
+          rpmbuild -ba --define "_topdir $TOPDIR" "$TOPDIR/SPECS/openssh.spec" 2>&1 | tee /tmp/rpmbuild.log
+
+      - name: Show built packages
+        run: |
+          set -eux
+          rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\t%{SIZE} bytes\n' "$TOPDIR"/RPMS/*/*.rpm
+
+      - name: Upload RPMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssh-${{ steps.source.outputs.version }}-el8.x86_64
+          path: |
+            rpmbuild/RPMS/*/*.rpm
+            rpmbuild/SRPMS/*.rpm
+          if-no-files-found: error
+          retention-days: 14
