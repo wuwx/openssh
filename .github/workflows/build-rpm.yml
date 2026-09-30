@@ -1,4 +1,4 @@
-name: Build RPM (CentOS 7 / Rocky Linux 8 / 9)
+name: Build RPM (CentOS 7 / Rocky Linux 8 / 9 / 10)
 
 on:
   push:
@@ -39,6 +39,12 @@ jobs:
             crb: crb
             # RHEL9 移除了 imake，改从 EPEL 获取（imake-1.0.8-6.el9）
             epel: true
+          - os: el10
+            image: rockylinux:10
+            crb: crb
+            # RHEL10 把 imake 和 gtk2-devel 都移除了，两者均由 EPEL 10 提供
+            # （imake-1.0.10、gtk2-devel-2.24.33）
+            epel: true
     env:
       # RPM 构建树根目录（%_topdir），放在 workspace 内便于收集产物
       TOPDIR: ${{ github.workspace }}/rpmbuild
@@ -66,8 +72,8 @@ jobs:
             perl openssl-devel krb5-devel pam-devel \
             glibc-devel libXt-devel gtk2-devel pkgconf-pkg-config \
             util-linux tar gzip
-          # x11-ssh-askpass 用 xmkmf(imake) 构建：el8 来自 CRB，el9 来自 EPEL
-          # 基础镜像自带 curl（el9 为 curl-minimal），不能再装 curl 以免依赖冲突
+          # x11-ssh-askpass 用 xmkmf(imake) 构建：el8 来自 CRB，el9/el10 来自 EPEL
+          # 基础镜像自带 curl（el9/el10 为 curl-minimal），不能再装 curl 以免依赖冲突
           dnf -y install imake
 
       - name: Fetch sources
