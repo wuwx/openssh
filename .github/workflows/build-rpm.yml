@@ -1,4 +1,4 @@
-name: Build RPM (Rocky Linux 8 / 9)
+name: Build RPM (CentOS 7 / Rocky Linux 8 / 9)
 
 on:
   push:
@@ -15,14 +15,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # RPM 构建树根目录（%_topdir），放在 workspace 内便于收集产物
-  TOPDIR: ${{ github.workspace }}/rpmbuild
   # Source1 的上游地址 www.jmknoble.net 现已位于 Cloudflare 挑战页之后，CI 无法下载。
   # 改用 Fedora 归档中同一份 x11-ssh-askpass tarball，并用 md5 校验完整性。
   ASKPASS_TARBALL: x11-ssh-askpass-1.2.4.1.tar.gz
   ASKPASS_MD5: 8f2e41f3f7eaa8543a2440454637f3c3
 
 jobs:
+  # Rocky 8 / 9：镜像的 glibc 够新，可直接使用 job 级 container
   build:
     name: Build RPM on Rocky Linux (${{ matrix.os }})
     runs-on: ubuntu-24.04
@@ -40,6 +39,9 @@ jobs:
             crb: crb
             # RHEL9 移除了 imake，改从 EPEL 获取（imake-1.0.8-6.el9）
             epel: true
+    env:
+      # RPM 构建树根目录（%_topdir），放在 workspace 内便于收集产物
+      TOPDIR: ${{ github.workspace }}/rpmbuild
     container:
       image: ${{ matrix.image }}
       options: --user root
@@ -108,3 +110,114 @@ jobs:
             rpmbuild/SRPMS/*.rpm
           if-no-files-found: error
           retention-days: 14
+
+  # CentOS 7：镜像的 glibc 只有 2.17，跑不了 node20 版的 action（checkout / upload-artifact），
+  # 因此不能用 job 级 container，改为起一个常驻容器，用 docker exec 逐步执行。
+  build-centos7:
+    name: Build RPM on CentOS 7 (el7)
+    runs-on: ubuntu-24.04
+    env:
+      # 构建树放在容器外挂载的 /tmp 下，避免 root 在 workspace 里留下属主为 root 的文件
+      TOPDIR: /tmp/rpmbuild
+      BUILDER: centos7-builder
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare build tree
+        run: |
+          set -eux
+          mkdir -p "$TOPDIR"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
+          cp openssh.spec "$TOPDIR/SPECS/"
+
+      - name: Start CentOS 7 build container
+        run: |
+          set -eux
+          docker run -d --name "$BUILDER" -v "$TOPDIR:$TOPDIR" centos:7 sleep infinity
+
+      - name: Configure repos and install build dependencies
+        run: |
+          set -eux
+          docker exec -i "$BUILDER" bash -s <<'EOS'
+          set -eux
+          # CentOS 7 已 EOL，官方 mirrorlist 失效，需切换到 vault 镜像
+          VAULT=""
+          for m in https://mirrors.aliyun.com/centos-vault/7.9.2009 \
+                   https://mirrors.ustc.edu.cn/centos-vault/7.9.2009 \
+                   https://repo.huaweicloud.com/centos-vault/7.9.2009 \
+                   https://mirror.nsc.liu.se/centos-store/7.9.2009; do
+            if curl -fsSL --max-time 20 -o /dev/null "$m/os/x86_64/repodata/repomd.xml"; then
+              VAULT="$m"
+              break
+            fi
+          done
+          [ -n "$VAULT" ] || { echo "no usable CentOS 7 vault mirror"; exit 1; }
+          sed -i -e 's|^mirrorlist=|#mirrorlist=|' \
+            -e "s|^#baseurl=http://mirror.centos.org/centos/\$releasever|baseurl=$VAULT|" \
+            /etc/yum.repos.d/CentOS-Base.repo
+
+          # EPEL 7 同样已归档；spec 的 %if 0%{?rhel} == 7 分支需要 openssl11-devel(>= 1.1.1)
+          yum -y install epel-release
+          sed -i -e 's|^metalink=|#metalink=|' \
+            -e 's|^#baseurl=https\?://download.fedoraproject.org/pub/epel/|baseurl=https://archives.fedoraproject.org/pub/archive/epel/|' \
+            -e 's|^gpgkey=.*|gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7|' \
+            /etc/yum.repos.d/epel*.repo
+          rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7
+
+          # 说明：spec 的 BuildRequires 写了 /bin/login，`yum-builddep` 会因该依赖
+          # 无法解析而整体失败，因此这里按 spec 逐项安装等价依赖。
+          yum -y install \
+            rpm-build make gcc \
+            perl openssl11-devel krb5-devel pam-devel \
+            glibc-devel libXt-devel gtk2-devel pkgconfig \
+            imake tar gzip
+          EOS
+
+      - name: Fetch sources
+        id: source
+        run: |
+          set -eux
+          VERSION="$(docker exec "$BUILDER" rpmspec -q --qf '%{version}\n' "$TOPDIR/SPECS/openssh.spec" | head -n1)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          docker exec -i -e TOPDIR="$TOPDIR" -e VERSION="$VERSION" \
+            -e ASKPASS_TARBALL="$ASKPASS_TARBALL" -e ASKPASS_MD5="$ASKPASS_MD5" \
+            "$BUILDER" bash -s <<'EOS'
+          set -eux
+          # Source0
+          curl -fSL --retry 3 --retry-delay 2 \
+            -o "$TOPDIR/SOURCES/openssh-$VERSION.tar.gz" \
+            "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-$VERSION.tar.gz"
+          # Source1: x11-ssh-askpass（Fedora lookaside 归档）
+          curl -fSL --retry 3 --retry-delay 2 \
+            -o "$TOPDIR/SOURCES/$ASKPASS_TARBALL" \
+            "https://src.fedoraproject.org/lookaside/pkgs/openssh/$ASKPASS_TARBALL/$ASKPASS_MD5/$ASKPASS_TARBALL"
+          echo "$ASKPASS_MD5  $TOPDIR/SOURCES/$ASKPASS_TARBALL" | md5sum -c -
+          EOS
+
+      - name: Build RPM
+        run: |
+          set -eux
+          docker exec -e TOPDIR="$TOPDIR" "$BUILDER" \
+            rpmbuild -ba --define "_topdir $TOPDIR" "$TOPDIR/SPECS/openssh.spec"
+
+      - name: Show built packages
+        run: |
+          set -eux
+          docker exec -i -e TOPDIR="$TOPDIR" "$BUILDER" bash -s <<'EOS'
+          rpm -qp --qf '%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\t%{SIZE} bytes\n' "$TOPDIR"/RPMS/*/*.rpm
+          EOS
+
+      - name: Upload RPMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssh-${{ steps.source.outputs.version }}-el7.x86_64
+          path: |
+            /tmp/rpmbuild/RPMS/*/*.rpm
+            /tmp/rpmbuild/SRPMS/*.rpm
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f "$BUILDER" || true
