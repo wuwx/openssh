@@ -1,4 +1,4 @@
-name: Build RPM (CentOS 7 / Rocky Linux 8 / 9 / 10)
+name: Build RPM (CentOS 6 / 7 / Rocky Linux 8 / 9 / 10)
 
 on:
   push:
@@ -117,15 +117,39 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # CentOS 7：镜像的 glibc 只有 2.17，跑不了 node20 版的 action（checkout / upload-artifact），
-  # 因此不能用 job 级 container，改为起一个常驻容器，用 docker exec 逐步执行。
-  build-centos7:
-    name: Build RPM on CentOS 7 (el7)
+  # CentOS 6/7：镜像的 glibc 过旧（2.12/2.17），跑不了 node20 版的 action
+  # （checkout / upload-artifact），因此不能用 job 级 container，
+  # 改为起一个常驻容器，用 docker exec 逐步执行。
+  build-legacy:
+    name: Build RPM on CentOS (${{ matrix.os }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: el6
+            image: centos:6
+            vault: 6.10
+            # el6 官方仓库没有 openssl 1.1.1（OpenSSH 9.x+ 要求），
+            # spec 会对 rhel<=6 自动走 --without-openssl 分支（仅支持
+            # ed25519 等不依赖 OpenSSL 的算法），无需 EPEL / openssl11
+            epel: false
+            openssl_pkg: ""
+            # centos:6 极简镜像不带 /bin/login（属于 util-linux-ng），
+            # 而 spec 的 BuildRequires 写了 /bin/login，必须补装
+            login_pkg: util-linux-ng
+          - os: el7
+            image: centos:7
+            vault: 7.9.2009
+            # spec 的 %if 0%{?rhel} == 7 分支需要 openssl11-devel(>= 1.1.1)，
+            # 仅存在于已归档的 EPEL 7
+            epel: true
+            openssl_pkg: openssl11-devel
+            login_pkg: ""
     env:
       # 构建树放在容器外挂载的 /tmp 下，避免 root 在 workspace 里留下属主为 root 的文件
       TOPDIR: /tmp/rpmbuild
-      BUILDER: centos7-builder
+      BUILDER: legacy-builder
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -136,54 +160,63 @@ jobs:
           mkdir -p "$TOPDIR"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
           cp openssh.spec "$TOPDIR/SPECS/"
 
-      - name: Start CentOS 7 build container
+      - name: Start build container
         run: |
           set -eux
-          docker run -d --name "$BUILDER" -v "$TOPDIR:$TOPDIR" centos:7 sleep infinity
+          docker run -d --name "$BUILDER" -v "$TOPDIR:$TOPDIR" ${{ matrix.image }} sleep infinity
 
       - name: Configure repos and install build dependencies
         run: |
           set -eux
-          docker exec -i "$BUILDER" bash -s <<'EOS'
+          docker exec -i \
+            -e VAULT_VER="${{ matrix.vault }}" \
+            -e EPEL="${{ matrix.epel }}" \
+            -e OPENSSL_PKG="${{ matrix.openssl_pkg }}" \
+            -e LOGIN_PKG="${{ matrix.login_pkg }}" \
+            "$BUILDER" bash -s <<'EOS'
           set -eux
-          # CentOS 7 已 EOL，官方 mirrorlist 失效，需切换到 vault 镜像
+          # CentOS 已 EOL，官方 mirrorlist 失效，需切换到 vault 镜像
           VAULT=""
-          for m in https://mirrors.aliyun.com/centos-vault/7.9.2009 \
-                   https://mirrors.ustc.edu.cn/centos-vault/7.9.2009 \
-                   https://repo.huaweicloud.com/centos-vault/7.9.2009 \
-                   https://mirror.nsc.liu.se/centos-store/7.9.2009; do
+          for m in https://mirrors.aliyun.com/centos-vault/$VAULT_VER \
+                   https://mirrors.ustc.edu.cn/centos-vault/$VAULT_VER \
+                   https://repo.huaweicloud.com/centos-vault/$VAULT_VER \
+                   https://mirror.nsc.liu.se/centos-store/$VAULT_VER; do
             if curl -fsSL --max-time 20 -o /dev/null "$m/os/x86_64/repodata/repomd.xml"; then
               VAULT="$m"
               break
             fi
           done
-          [ -n "$VAULT" ] || { echo "no usable CentOS 7 vault mirror"; exit 1; }
+          [ -n "$VAULT" ] || { echo "no usable CentOS vault mirror"; exit 1; }
           sed -i -e 's|^mirrorlist=|#mirrorlist=|' \
             -e "s|^#baseurl=http://mirror.centos.org/centos/\$releasever|baseurl=$VAULT|" \
             /etc/yum.repos.d/CentOS-Base.repo
 
-          # EPEL 7 同样已归档；spec 的 %if 0%{?rhel} == 7 分支需要 openssl11-devel(>= 1.1.1)
-          yum -y install epel-release
-          sed -i -e 's|^metalink=|#metalink=|' \
-            -e 's|^#baseurl=https\?://download.fedoraproject.org/pub/epel/|baseurl=https://archives.fedoraproject.org/pub/archive/epel/|' \
-            -e 's|^gpgkey=.*|gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7|' \
-            /etc/yum.repos.d/epel*.repo
-          rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7
+          if [ "$EPEL" = "true" ]; then
+            # EPEL 7 同样已归档
+            yum -y install epel-release
+            sed -i -e 's|^metalink=|#metalink=|' \
+              -e 's|^#baseurl=https\?://download.fedoraproject.org/pub/epel/|baseurl=https://archives.fedoraproject.org/pub/archive/epel/|' \
+              -e 's|^gpgkey=.*|gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7|' \
+              /etc/yum.repos.d/epel*.repo
+            rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7
+          fi
 
           # 说明：spec 的 BuildRequires 写了 /bin/login，`yum-builddep` 会因该依赖
           # 无法解析而整体失败，因此这里按 spec 逐项安装等价依赖。
-          yum -y install \
-            rpm-build make gcc \
-            perl openssl11-devel krb5-devel pam-devel \
-            glibc-devel libXt-devel gtk2-devel pkgconfig \
-            imake tar gzip
+          PKGS=(rpm-build make gcc perl krb5-devel pam-devel \
+            glibc-devel libXt-devel gtk2-devel pkgconfig imake tar gzip)
+          [ -n "$OPENSSL_PKG" ] && PKGS+=("$OPENSSL_PKG")
+          [ -n "$LOGIN_PKG" ] && PKGS+=("$LOGIN_PKG")
+          yum -y install "${PKGS[@]}"
           EOS
 
       - name: Fetch sources
         id: source
         run: |
           set -eux
-          VERSION="$(docker exec "$BUILDER" rpmspec -q --qf '%{version}\n' "$TOPDIR/SPECS/openssh.spec" | head -n1)"
+          # el6 的 rpm(4.8) 没有 rpmspec 命令，直接从 spec 文本解析版本号
+          VERSION="$(sed -n 's/^%global ver[[:space:]][[:space:]]*\([^[:space:]]*\).*/\1/p' openssh.spec | head -n1)"
+          [ -n "$VERSION" ] || { echo "cannot parse version from openssh.spec"; exit 1; }
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           docker exec -i -e TOPDIR="$TOPDIR" -e VERSION="$VERSION" \
@@ -217,7 +250,7 @@ jobs:
       - name: Upload RPMs
         uses: actions/upload-artifact@v4
         with:
-          name: openssh-${{ steps.source.outputs.version }}-el7.x86_64
+          name: openssh-${{ steps.source.outputs.version }}-${{ matrix.os }}.x86_64
           path: |
             /tmp/rpmbuild/RPMS/*/*.rpm
             /tmp/rpmbuild/SRPMS/*.rpm
@@ -228,11 +261,11 @@ jobs:
         if: always()
         run: docker rm -f "$BUILDER" || true
 
-  # 仅在推送 v* 标签时执行：收集两个构建 job 的产物并推送到 packagecloud.io
+  # 仅在推送 v* 标签时执行：收集所有构建 job 的产物并推送到 packagecloud.io
   release:
     name: Push RPMs to packagecloud.io
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, build-centos7]
+    needs: [build, build-legacy]
     runs-on: ubuntu-24.04
     env:
       PACKAGECLOUD_REPO: wuwx/openssh
@@ -256,9 +289,11 @@ jobs:
           shopt -s nullglob
           rpms=(artifacts/RPMS/*/*.rpm artifacts/SRPMS/*.rpm)
           [ ${#rpms[@]} -gt 0 ] || { echo "no RPMs found"; exit 1; }
-          # 从文件名里的 dist tag（.el7/.el8/...）推断目标发行版仓库，
-          # 两个构建 job 的 artifact 内部结构一致：RPMS/<arch>/*.rpm 与 SRPMS/*.rpm
+          # 从文件名里的 dist tag（.el6/.el7/...）推断目标发行版仓库，
+          # 各构建 job 的 artifact 内部结构一致：RPMS/<arch>/*.rpm 与 SRPMS/*.rpm
           for rpm in "${rpms[@]}"; do
+            # debuginfo 包对软件源使用者没有意义，不推送
+            case "$rpm" in *debuginfo*) continue ;; esac
             if [[ $rpm =~ \.el([0-9]+)\. ]]; then
               package_cloud push "$PACKAGECLOUD_REPO/el/${BASH_REMATCH[1]}" "$rpm"
             else
